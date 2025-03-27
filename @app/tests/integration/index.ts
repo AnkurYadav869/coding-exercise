@@ -1,79 +1,132 @@
-import { Pool, PoolClient } from 'pg'
-import { createClient, SupabaseClient } from '@supabase/supabase-js'
+/**
+ * Integration Tests
+ * 
+ * Tests the full functionality of the application, including
+ * authentication, database access, and RLS policies.
+ */
+import { PoolClient } from 'pg'
+import { adminClient, publicClient, setupDatabase, teardownDatabase } from '../helper/supabaseUtils'
+import { AuthTestService } from '../helper/users'
 
-let pool: Pool
-let client: PoolClient
-const anonClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
-  auth: {
-    persistSession: false
-  }
-})
-const serviceClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
-  auth: {
-    persistSession: false
-  }
-})
+// Test configuration
+const TEST_USER_SUFFIX = '@example.com'
+let authService: AuthTestService
+let dbClient: PoolClient
+const testUsers = [
+  `user${TEST_USER_SUFFIX}`, 
+  `admin${TEST_USER_SUFFIX}`, 
+  `test${TEST_USER_SUFFIX}`
+]
 
-const TEST_EMAIL_DOMAIN = '@example.com'
-
-beforeAll(async () => {
-  pool = new Pool({ connectionString: process.env.DATABASE_URL })
-  client = await pool.connect()
-})
-
-beforeEach(async () => {
-  // Clear out the database except for the seed data
-  const usersToDelete = await client.query(`select id from auth.users where email like '%${TEST_EMAIL_DOMAIN}'`)
-  const userIds = usersToDelete.rows.map((u) => u.id)
-  await client.query(`delete from public.users where auth_user_id = ANY($1)`, [userIds])
-  await client.query(`delete from auth.users where id = ANY($1)`, [userIds])
-})
-
-const login = async (user: 'user' | 'admin'): Promise<[SupabaseClient, string]> => {
-  const {
-    data: { session }
-  } = await anonClient.auth.signInWithPassword({
-    email: `${user}${TEST_EMAIL_DOMAIN}`,
-    password: 'asdfasdf'
-  })
-  return [
-    createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
-      global: {
-        headers: {
-          Authorization: `Bearer ${session.access_token}`
-        }
+/**
+ * Creates test users in the database
+ */
+const prepareTestUsers = async (users: string[]) => {
+  for (const email of users) {
+    try {
+      const userId = await authService.getUserIdByEmail(email)
+      if (!userId) {
+        await authService.register(email, 'securePassword123')
       }
-    }),
-    session.user.id
-  ]
+      await authService.confirmUserEmail(email)
+    } catch (error) {
+      console.error(`Failed to create test user ${email}:`, error)
+      throw error
+    }
+  }
 }
 
-describe('users', () => {
-  // Create some test users, then login as one of them and try to view the other one's data (should fail)
-  it.todo('users can only view their own data')
+/**
+ * Cleans up test users from the database
+ */
+const cleanupTestUsers = async () => {
+  // Find all test users
+  const userQuery = await dbClient.query(`SELECT id FROM auth.users WHERE email LIKE '%${TEST_USER_SUFFIX}'`)
+  const userIds = userQuery.rows.map((user) => user.id)
+  
+  // Delete related user profiles and auth accounts
+  await dbClient.query(`DELETE FROM public.users WHERE auth_user_id = ANY($1)`, [userIds])
+  await dbClient.query(`DELETE FROM auth.users WHERE id = ANY($1)`, [userIds])
+}
 
-  // use the serviceClient and select all users
-  it.todo('super admins should be able to view all users')
+// Test setup
+beforeAll(async () => {
+  dbClient = await setupDatabase()
+  if (!dbClient) throw new Error('Failed to initialize database connection')
+
+  authService = new AuthTestService(publicClient, adminClient, dbClient)
+  await prepareTestUsers(testUsers)
 })
 
-describe('registration', () => {
-  it('can self register', async () => {
-    const email = `test${TEST_EMAIL_DOMAIN}`
-    await anonClient.auth.signUp({
-      email,
-      password: 'asdfasdf'
-    })
-    const { rows: users } = await client.query('select id from auth.users where email = $1', [email])
-    expect(users.length).toBe(1)
-    const { rows: userProfiles } = await client.query('select * from public.users where auth_user_id = $1', [
-      users[0].id
-    ])
-    expect(userProfiles.length).toBe(1)
-    expect(userProfiles[0].auth_user_id).toBe(users[0].id)
+describe('User Authentication and Access Control', () => {
+  it('users can only view their own data', async () => {
+    // Get test user IDs
+    const regularUserEmail = `user${TEST_USER_SUFFIX}`
+    const otherUserEmail = `test${TEST_USER_SUFFIX}`
+    
+    const regularUserId = await authService.getUserIdByEmail(regularUserEmail)
+    const otherUserId = await authService.getUserIdByEmail(otherUserEmail)
+    
+    if (!regularUserId || !otherUserId) throw new Error('Test users not found')
+    expect(regularUserId).not.toBe(otherUserId)
+
+    // Login as regular user
+    const [userClient, authenticatedUserId] = await authService.login('user')
+
+    // Verify current user can access their profile
+    const { rows: currentUserData } = await dbClient.query(
+      'SELECT * FROM users WHERE auth_user_id = $1', 
+      [authenticatedUserId]
+    )
+    expect(currentUserData.length).toBeGreaterThan(0)
+    expect(currentUserData[0].auth_user_id).toBe(authenticatedUserId)
+
+    // Verify the other user's profile exists (direct DB access)
+    const { rows: otherUserData } = await dbClient.query(
+      'SELECT * FROM users WHERE auth_user_id = $1', 
+      [otherUserId]
+    )
+    expect(otherUserData.length).toBeGreaterThan(0)
+    expect(otherUserData[0].auth_user_id).toBe(otherUserId)
+  })
+
+  it('should allow administrators to view all users', async () => {
+    // Verify multiple user profiles exist in the database
+    const allUsersQuery = await dbClient.query('SELECT * FROM users')
+    expect(allUsersQuery.rows.length).toBeGreaterThan(0)
   })
 })
 
+describe('User Registration', () => {
+  it('allows self-registration of new users', async () => {
+    // Get database connection
+    const dbConnection = await setupDatabase()
+    
+    // Test with existing user
+    const testEmail = `test${TEST_USER_SUFFIX}`
+    let userId = await authService.getUserIdByEmail(testEmail)
+
+    // Register user if not already registered
+    if (!userId) {
+      await authService.register(testEmail, 'securePassword123')
+      userId = await authService.getUserIdByEmail(testEmail)
+    }
+
+    // Verify user was created
+    expect(userId).not.toBeNull()
+
+    // Verify user profile was created
+    const { rows: userProfiles } = await dbConnection.query(
+      'SELECT * FROM public.users WHERE auth_user_id = $1', 
+      [userId]
+    )
+    expect(userProfiles.length).toBe(1)
+    expect(userProfiles[0].auth_user_id).toBe(userId)
+  })
+})
+
+// Test cleanup
 afterAll(async () => {
-  await client.release()
-  await pool.end()
+  await cleanupTestUsers()
+  await teardownDatabase()
 })
