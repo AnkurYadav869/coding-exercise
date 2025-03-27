@@ -9,11 +9,13 @@
     "lint": "yarn prettier:check",
     "test": "yarn workspace @app/tests run test"
   },
-  "devDependencies": {
+ "devDependencies": {
+    "@supabase/supabase-js": "^2.49.3",
     "lerna": "^7.1.4",
-    "prettier": "^2.2.1"
+    "prettier": "^2.2.1",
+    "supabase": "^2.20.5",
+    "vitest": "^3.0.9"
   },
-  "dependencies": {},
   "workspaces": {
     "packages": [
       "@app/scripts",
